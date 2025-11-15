@@ -1,256 +1,398 @@
-# app.py
+"""
+Профессиональная система оптимизации ассортимента SKU на основе Reinforcement Learning
+
+Автор: Data Science Team
+Версия: 1.0.0
+"""
+
 import streamlit as st
 import pandas as pd
 import numpy as np
-from collections import defaultdict
-import math
+from pathlib import Path
+import logging
+from io import StringIO
+import sys
 
-st.set_page_config(layout="wide", page_title="RL Assortment (minimal)")
+# Добавляем src в путь
+sys.path.insert(0, str(Path(__file__).parent))
 
-st.title("Минимальный RL для управления ассортиментом — Demo")
+from src.data_loader import SalesDataLoader
+from src.features import SKUFeatureEngineering, SegmentAnalyzer
+from src.environment import SKUEnvironment
+from src.agents import DQNAgent
+from src.metrics import PerformanceTracker
+from src.visualization import AssortmentVisualizer
 
-st.markdown(
-    """
-Коротко: загрузите Excel с колонками:
-`Magazin, Datasales, Art, Describe, Model, Segment, purchprice, Price, Qty, Sum`
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-Далее выберите магазин и запустите простой Q-learning симулятор.
-"""
+# Конфигурация Streamlit
+st.set_page_config(
+    layout="wide",
+    page_title="SKU Optimization System - RL",
+    page_icon="📊"
 )
 
-uploaded = st.file_uploader("Загрузите Excel (.xlsx/.xls) с продажами", type=["xlsx", "xls", "csv"])
-if uploaded is None:
-    st.info("Загрузите файл чтобы продолжить. Можете использовать CSV.")
-    st.stop()
-
-# load
-if uploaded.name.endswith(".csv"):
-    df = pd.read_csv(uploaded)
-else:
-    df = pd.read_excel(uploaded)
-
-# basic checks
-required = {"Magazin","Datasales","Art","Segment","purchprice","Price","Qty","Sum"}
-missing = required - set(df.columns)
-if missing:
-    st.error(f"В файле отсутствуют колонки: {missing}")
-    st.stop()
-
-# preprocess
-df["Datasales"] = pd.to_datetime(df["Datasales"], errors="coerce")
-df["Price"] = pd.to_numeric(df["Price"], errors="coerce").fillna(0)
-df["purchprice"] = pd.to_numeric(df["purchprice"], errors="coerce").fillna(0)
-df["Qty"] = pd.to_numeric(df["Qty"], errors="coerce").fillna(0)
-df["Sum"] = pd.to_numeric(df["Sum"], errors="coerce").fillna(df["Price"]*df["Qty"])
-
-stores = df["Magazin"].unique().tolist()
-store = st.selectbox("Выберите магазин", stores)
-
-# aggregate features per SKU for selected store
-df_store = df[df["Magazin"] == store].copy()
-sku_agg = df_store.groupby("Art").agg({
-    "Qty":"sum",
-    "Sum":"sum",
-    "Price":"mean",
-    "purchprice":"mean",
-    "Datasales":"count",
-    "Segment": lambda x: x.mode().iloc[0] if len(x)>0 else "NA"
-}).rename(columns={"Datasales":"transactions"})
-sku_agg["turnover"] = sku_agg["Qty"] / np.maximum(1, sku_agg["transactions"])
-sku_agg["margin"] = sku_agg["Price"] - sku_agg["purchprice"]
-# approximate stock if provided
-if "Stock" in df_store.columns:
-    stock = df_store.groupby("Art")["Stock"].last()
-    sku_agg["stock"] = stock
-else:
-    sku_agg["stock"] = sku_agg["Qty"].rolling(1).apply(lambda x: max(1, int(x.mean()/10))).fillna(5)  # heuristic
-
-sku_agg = sku_agg.reset_index()
-
-st.subheader("Агрегированные характеристики SKU (пример)")
-st.dataframe(sku_agg.head(50))
-
-# RL parameters
-st.sidebar.header("RL параметры")
-n_episodes = st.sidebar.slider("Эпизодов обучения", 10, 2000, 200, step=10)
-max_steps = st.sidebar.slider("Макс шагов на эпизод (SKU actions per episode)", 1, 50, 10)
-alpha = st.sidebar.number_input("Alpha (скорость обучения)", min_value=0.001, max_value=1.0, value=0.2)
-gamma = st.sidebar.number_input("Gamma (дисконт)", min_value=0.0, max_value=1.0, value=0.95)
-epsilon = st.sidebar.number_input("Epsilon (exploration)", min_value=0.0, max_value=1.0, value=0.2)
-
-# discretize state: bucket turnover and margin and stock
-def discretize(row):
-    t = row["turnover"]
-    m = row["margin"]
-    s = row["stock"]
-    tb = int(np.clip(np.digitize(t, [0.1,0.5,1,2,5]), 0, 5))
-    mb = int(np.clip(np.digitize(m, [0,5,10,20]), 0, 4))
-    sb = int(np.clip(np.digitize(s, [0,2,5,10,20]), 0, 5))
-    return (tb, mb, sb, row["Segment"])
-
-sku_agg["_state"] = sku_agg.apply(discretize, axis=1)
-
-# actions: 0 keep,1 remove,2 increase_depth,3 decrease_depth
-ACTIONS = {0:"keep",1:"remove",2:"inc_depth",3:"dec_depth"}
-
-# initial Q-table: keyed by state + art
-Q = defaultdict(lambda: np.zeros(len(ACTIONS)))
-
-# simple environment simulator (heuristic)
-def step_env(sku_df, art, action):
-    """
-    возвращает: reward, new_qty_estimate
-    Правила (примитивные):
-     - keep: qty stays
-     - remove: qty -> 0, fraction (shift) r распределяется по SKU того же сегмента
-     - inc_depth: qty * 1.1
-     - dec_depth: qty * 0.9
-    reward = delta_profit - penalty_oos
-    """
-    base = float(sku_df.loc[sku_df["Art"]==art, "Qty"].values[0])
-    price = float(sku_df.loc[sku_df["Art"]==art, "Price"].values[0])
-    purch = float(sku_df.loc[sku_df["Art"]==art, "purchprice"].values[0])
-    seg = sku_df.loc[sku_df["Art"]==art, "Segment"].values[0]
-    stock = float(sku_df.loc[sku_df["Art"]==art, "stock"].values[0])
-    old_profit = (price - purch) * base
-
-    # effects
-    if action == 0:
-        new_qty = base
-    elif action == 1:
-        # remove: fraction shifts to same-segment skus
-        shift = 0.4  # 40% of спроса перераспределится
-        new_qty = 0.0
-        # add amount to others (handled outside)
-    elif action == 2:
-        new_qty = base * 1.10
-    elif action == 3:
-        new_qty = base * 0.90
-    else:
-        new_qty = base
-
-    # oos penalty: if stock < new_qty => penalty
-    oos_penalty = 0.0
-    if stock < new_qty:
-        oos_penalty = (new_qty - stock) * 0.2 * price  # heuristic cost
-
-    new_profit = (price - purch) * new_qty
-    reward = new_profit - old_profit - oos_penalty
-    # when remove, we also return shifted amount to distribute
-    shift_amount = 0.4 * base if action==1 else 0.0
-    return reward, new_qty, shift_amount
-
-# helper to distribute shifted sales to same-segment SKUs proportionally by turnover
-def distribute_shift(sku_df, art, shift_amount):
-    seg = sku_df.loc[sku_df["Art"]==art,"Segment"].values[0]
-    pool = sku_df[(sku_df["Segment"]==seg) & (sku_df["Art"]!=art)].copy()
-    if pool.empty or shift_amount<=0:
-        return {}
-    pool["weight"] = pool["turnover"].clip(0.1)
-    pool["alloc"] = pool["weight"] / pool["weight"].sum()
-    alloc_map = (pool.set_index("Art")["alloc"] * shift_amount).to_dict()
-    return alloc_map
-
-# Training loop
-if st.button("Запустить обучение RL"):
-    progress = st.progress(0)
-    sku_df = sku_agg.copy()
-    # cache base quantities (so each episode starts from same history)
-    base_qty = sku_df.set_index("Art")["Qty"].to_dict()
-
-    for ep in range(n_episodes):
-        # reset environment per episode
-        sku_df["Qty_sim"] = sku_df["Art"].map(base_qty).astype(float)
-        for step in range(max_steps):
-            # sample random SKU to act on
-            art_row = sku_df.sample(1).iloc[0]
-            art = art_row["Art"]
-            state = art_row["_state"]
-            # epsilon-greedy
-            if np.random.rand() < epsilon:
-                action = np.random.randint(len(ACTIONS))
-            else:
-                action = int(np.argmax(Q[(state,art)]))
-            # apply
-            reward, new_qty, shift = step_env(sku_df, art, action)
-            # apply shift
-            if shift>0:
-                alloc = distribute_shift(sku_df, art, shift)
-                for a2, add in alloc.items():
-                    sku_df.loc[sku_df["Art"]==a2,"Qty_sim"] += add
-            # update this SKU qty
-            sku_df.loc[sku_df["Art"]==art,"Qty_sim"] = new_qty
-            # next_state: recompute discretized features with Qty_sim
-            tmp = sku_df[sku_df["Art"]==art].iloc[0].to_dict()
-            tmp["Qty"] = new_qty
-            tmp["turnover"] = new_qty / max(1, tmp.get("transactions",1))
-            next_state = discretize(tmp)
-            # Q-learning update
-            old_q = Q[(state,art)][action]
-            best_next = np.max(Q[(next_state,art)])
-            Q[(state,art)][action] = old_q + alpha * (reward + gamma * best_next - old_q)
-        if (ep+1) % max(1, (n_episodes//10)) == 0:
-            progress.progress((ep+1)/n_episodes)
-    st.success("Обучение завершено")
-
-    # produce policy recommendations
-    recs = []
-    for _, row in sku_agg.iterrows():
-        art = row["Art"]
-        s = row["_state"]
-        qvals = Q[(s,art)]
-        act = int(np.argmax(qvals))
-        recs.append({
-            "Art": art,
-            "Segment": row["Segment"],
-            "Qty": row["Qty"],
-            "Price": row["Price"],
-            "Margin": row["margin"],
-            "BestAction": ACTIONS[act],
-            "Qvals": np.round(qvals,2)
-        })
-    rec_df = pd.DataFrame(recs).sort_values(by=["Segment","Qty"], ascending=[True, False])
-    st.subheader("Рекомендации (политика по SKU)")
-    st.dataframe(rec_df.head(200))
-
-    # simple projected effect: apply recommended action and show delta GMV/profit
-    total_profit_before = ((sku_agg["Price"] - sku_agg["purchprice"]) * sku_agg["Qty"]).sum()
-    proj_profit = 0.0
-    for _, r in rec_df.iterrows():
-        art = r["Art"]
-        action = r["BestAction"]
-        price = r["Price"]
-        purch = r["Margin"]
-        qty = r["Qty"]
-        if action=="keep":
-            new_qty = qty
-        elif action=="remove":
-            new_qty = 0
-        elif action=="inc_depth":
-            new_qty = qty*1.1
-        else:
-            new_qty = qty*0.9
-        proj_profit += (price - (purch)) * new_qty  # careful: purch is margin i used earlier but it's fine for demo
-
-    st.metric("Прибыль до (approx)", f"{total_profit_before:,.0f}")
-    st.metric("Проекция прибыли после применения политики (approx)", f"{proj_profit:,.0f}")
-    st.caption("Числа — приближённые. Важно: перед применением в продакшен провести оффлайн-симуляции и A/B тесты.")
-
-# allow manual inspection / export
-st.sidebar.header("Экспорт")
-if st.sidebar.button("Скачать рекомендации (если обучали)"):
-    try:
-        rec_df  # if exists
-        csv = rec_df.to_csv(index=False).encode("utf-8")
-        st.sidebar.download_button("Скачать CSV", data=csv, file_name=f"recs_{store}.csv")
-    except NameError:
-        st.sidebar.error("Сначала запустите обучение и получите рекомендации.")
-
+# Стили
 st.markdown("""
----  
-**Примечание:** это минимальный демонстрационный код. Для рабочего решения:
-- нужен реалистичный эмулятор спроса / causal models, чтобы не навредить продажам,  
-- поддержка A/B тестирования, rollback, мониторинг KPI,  
-- более богатое состояние (история продаж, промо, цена конкурентов),  
-- алгоритмы: contextual bandits / PPO / DQN для сложных сцен, и off-policy evaluation.
-""")
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        font-weight: bold;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .sub-header {
+        font-size: 1.2rem;
+        color: #555;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-box {
+        background-color: #f0f2f6;
+        padding: 1rem;
+        border-radius: 0.5rem;
+        border-left: 4px solid #1f77b4;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# Заголовок
+st.markdown('<div class="main-header">🎯 SKU Optimization System</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="sub-header">Reinforcement Learning для умного управления ассортиментом</div>',
+    unsafe_allow_html=True
+)
+
+# Sidebar - Конфигурация
+st.sidebar.header("⚙️ Конфигурация")
+
+# Инициализация session state
+if 'data_loaded' not in st.session_state:
+    st.session_state.data_loaded = False
+if 'model_trained' not in st.session_state:
+    st.session_state.model_trained = False
+if 'recommendations' not in st.session_state:
+    st.session_state.recommendations = None
+
+
+# ============= 1. ЗАГРУЗКА ДАННЫХ =============
+st.header("📂 1. Загрузка данных")
+
+uploaded_file = st.file_uploader(
+    "Загрузите Excel или CSV файл с продажами",
+    type=["xlsx", "xls", "csv"],
+    help="Файл должен содержать колонки: Magazin, Datasales, Art, Segment, purchase_price, Price, Qty, Sum"
+)
+
+if uploaded_file is not None:
+    try:
+        with st.spinner("Загрузка и обработка данных..."):
+            # Сохранить временно файл
+            temp_path = Path(f"temp_{uploaded_file.name}")
+            with open(temp_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+
+            # Загрузка данных
+            data_loader = SalesDataLoader()
+            df = data_loader.load(str(temp_path))
+
+            # Удалить временный файл
+            temp_path.unlink()
+
+            st.session_state.data_loader = data_loader
+            st.session_state.df = df
+            st.session_state.data_loaded = True
+
+        st.success(f"✅ Загружено {len(df)} записей, {df['Art'].nunique()} уникальных SKU")
+
+        # Показать сводку
+        col1, col2, col3, col4 = st.columns(4)
+        summary = data_loader.get_summary_stats()
+
+        with col1:
+            st.metric("Общий GMV", f"{summary['total_gmv']:,.0f} ₽")
+        with col2:
+            st.metric("Магазинов", summary['unique_stores'])
+        with col3:
+            st.metric("Сегментов", summary['unique_segments'])
+        with col4:
+            st.metric("SKU", summary['unique_skus'])
+
+        # Превью данных
+        with st.expander("📊 Превью данных"):
+            st.dataframe(df.head(100), use_container_width=True)
+
+    except Exception as e:
+        st.error(f"❌ Ошибка при загрузке данных: {str(e)}")
+        logger.error(f"Ошибка загрузки: {e}", exc_info=True)
+        st.session_state.data_loaded = False
+
+else:
+    st.info("👆 Загрузите файл с данными для начала работы")
+    st.stop()
+
+
+# ============= 2. ВЫБОР МАГАЗИНА И НАСТРОЙКИ =============
+if st.session_state.data_loaded:
+    st.header("🏪 2. Выбор магазина и параметры")
+
+    stores = st.session_state.data_loader.get_summary_stats()['stores']
+    selected_store = st.selectbox("Выберите магазин для оптимизации:", stores)
+
+    # Параметры RL
+    st.sidebar.subheader("🤖 Параметры RL агента")
+    n_episodes = st.sidebar.slider("Количество эпизодов обучения", 10, 1000, 200, step=10)
+    max_steps_per_episode = st.sidebar.slider("Макс. шагов на эпизод", 10, 100, 50, step=5)
+    learning_rate = st.sidebar.number_input("Learning Rate", 0.0001, 0.01, 0.001, format="%.4f")
+    gamma = st.sidebar.slider("Gamma (дисконт)", 0.90, 0.99, 0.95, step=0.01)
+    epsilon_start = st.sidebar.slider("Epsilon (начальный)", 0.5, 1.0, 1.0, step=0.05)
+    epsilon_min = st.sidebar.slider("Epsilon (минимальный)", 0.01, 0.2, 0.05, step=0.01)
+
+    # Получить данные по магазину
+    store_df = st.session_state.data_loader.get_store_data(selected_store)
+    sku_agg = st.session_state.data_loader.get_sku_aggregates(selected_store)
+
+    st.info(f"📦 В магазине **{selected_store}** доступно **{len(sku_agg)} SKU** для оптимизации")
+
+    # Показать топ SKU
+    with st.expander("🔝 Топ-20 SKU по GMV"):
+        top_skus = sku_agg.nlargest(20, 'Sum_sum')[
+            ['Art', 'Segment_<lambda>', 'Sum_sum', 'Qty_sum', 'margin_mean', 'num_transactions']
+        ].rename(columns={
+            'Segment_<lambda>': 'Segment',
+            'Sum_sum': 'GMV',
+            'Qty_sum': 'Quantity',
+            'margin_mean': 'Avg Margin'
+        })
+        st.dataframe(top_skus, use_container_width=True)
+
+
+# ============= 3. ОБУЧЕНИЕ МОДЕЛИ =============
+if st.session_state.data_loaded:
+    st.header("🧠 3. Обучение RL модели")
+
+    if st.button("🚀 Запустить обучение DQN агента", type="primary"):
+        try:
+            with st.spinner("Обучение модели... Это может занять несколько минут."):
+                # Feature engineering
+                feature_eng = SKUFeatureEngineering(scaler_type='robust')
+                sku_with_features = feature_eng.engineer_features(sku_agg, fit=True)
+
+                # Создание environment
+                env = SKUEnvironment(
+                    sku_df=sku_with_features,
+                    feature_engineer=feature_eng,
+                    max_steps=max_steps_per_episode
+                )
+
+                # Создание агента
+                agent = DQNAgent(
+                    state_dim=env.state_dim,
+                    action_dim=env.action_dim,
+                    learning_rate=learning_rate,
+                    gamma=gamma,
+                    epsilon=epsilon_start,
+                    epsilon_min=epsilon_min,
+                    epsilon_decay=0.995,
+                    buffer_size=5000,
+                    batch_size=64
+                )
+
+                # Трекер прогресса
+                tracker = PerformanceTracker()
+
+                # Прогресс бар
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                metrics_container = st.empty()
+
+                # Обучение
+                for episode in range(n_episodes):
+                    state = env.reset()
+                    episode_reward = 0
+                    episode_losses = []
+
+                    for step in range(max_steps_per_episode):
+                        # Выбор действия
+                        action = agent.select_action(state, training=True)
+
+                        # Шаг в среде
+                        next_state, reward, done, info = env.step(action)
+                        episode_reward += reward
+
+                        # Обучение агента
+                        train_metrics = agent.train_step(state, action, reward, next_state, done)
+                        if train_metrics['loss'] > 0:
+                            episode_losses.append(train_metrics['loss'])
+
+                        state = next_state
+
+                        if done:
+                            break
+
+                    # Обновление epsilon
+                    agent.update_epsilon()
+
+                    # Записать результаты
+                    final_metrics = env.current_metrics
+                    tracker.record_episode(episode_reward, final_metrics)
+
+                    # Обновить прогресс
+                    progress = (episode + 1) / n_episodes
+                    progress_bar.progress(progress)
+                    status_text.text(
+                        f"Эпизод {episode + 1}/{n_episodes} | "
+                        f"Reward: {episode_reward:.2f} | "
+                        f"Epsilon: {agent.epsilon:.3f} | "
+                        f"Avg Loss: {np.mean(episode_losses) if episode_losses else 0:.4f}"
+                    )
+
+                    # Показать промежуточные результаты каждые 20 эпизодов
+                    if (episode + 1) % 20 == 0:
+                        summary = tracker.get_summary()
+                        with metrics_container.container():
+                            col1, col2, col3 = st.columns(3)
+                            col1.metric("Avg Reward", f"{summary['avg_reward']:.2f}")
+                            col2.metric("Best Reward", f"{summary['best_reward']:.2f}")
+                            col3.metric("Last 10 Avg", f"{summary['last_10_avg_reward']:.2f}")
+
+                # Сохранить результаты
+                st.session_state.agent = agent
+                st.session_state.env = env
+                st.session_state.tracker = tracker
+                st.session_state.feature_eng = feature_eng
+                st.session_state.sku_with_features = sku_with_features
+                st.session_state.model_trained = True
+
+            st.success("✅ Обучение завершено!")
+
+            # Итоговая сводка
+            summary = tracker.get_summary()
+            st.subheader("📊 Результаты обучения")
+
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Всего эпизодов", summary['total_episodes'])
+            col2.metric("Средний Reward", f"{summary['avg_reward']:.2f}")
+            col3.metric("Лучший Reward", f"{summary['best_reward']:.2f}")
+            col4.metric("Последние 10 эп.", f"{summary['last_10_avg_reward']:.2f}")
+
+            # График обучения
+            episodes, rewards = tracker.get_learning_curve()
+            visualizer = AssortmentVisualizer(use_plotly=True)
+            fig = visualizer.plot_learning_curve(episodes, rewards, title="Learning Curve - DQN Agent")
+            st.plotly_chart(fig, use_container_width=True)
+
+        except Exception as e:
+            st.error(f"❌ Ошибка при обучении: {str(e)}")
+            logger.error(f"Ошибка обучения: {e}", exc_info=True)
+
+
+# ============= 4. РЕЗУЛЬТАТЫ И РЕКОМЕНДАЦИИ =============
+if st.session_state.get('model_trained', False):
+    st.header("📈 4. Результаты и рекомендации")
+
+    env = st.session_state.env
+    agent = st.session_state.agent
+    tracker = st.session_state.tracker
+
+    # Получить итоговую сводку
+    final_summary = env.get_final_summary()
+
+    # Метрики улучшения
+    st.subheader("💰 Улучшение метрик")
+    col1, col2, col3, col4 = st.columns(4)
+
+    improvement = final_summary['improvement']
+    col1.metric("Прирост прибыли", f"{improvement['profit']:,.0f} ₽", delta=f"{improvement['profit']:,.0f}")
+    col2.metric("Прирост GMV", f"{improvement['gmv']:,.0f} ₽", delta=f"{improvement['gmv']:,.0f}")
+    col3.metric("Изменение ROI", f"{improvement['roi']:.2f}%", delta=f"{improvement['roi']:.2f}%")
+    col4.metric("Снижение OOS cost", f"{improvement['oos_cost_reduction']:,.0f} ₽")
+
+    # Действия агента
+    st.subheader("🎬 Распределение действий")
+    col1, col2 = st.columns([1, 2])
+
+    with col1:
+        action_breakdown = final_summary['action_breakdown']
+        st.write("**Статистика действий:**")
+        for action, count in action_breakdown.items():
+            st.write(f"- {action}: {count}")
+        st.write(f"\n**Удалено SKU:** {final_summary['removed_skus']}")
+        st.write(f"**Активных SKU:** {final_summary['active_skus']}")
+
+    with col2:
+        visualizer = AssortmentVisualizer(use_plotly=True)
+        fig = visualizer.plot_action_distribution(action_breakdown)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Рекомендации
+    st.subheader("📋 Рекомендации по SKU")
+    recommendations_df = env.get_recommendations()
+
+    # Фильтры
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        action_filter = st.multiselect(
+            "Фильтр по действиям:",
+            options=recommendations_df['Recommended_Action'].unique(),
+            default=recommendations_df['Recommended_Action'].unique()
+        )
+    with col2:
+        status_filter = st.multiselect(
+            "Фильтр по статусу:",
+            options=recommendations_df['Status'].unique(),
+            default=recommendations_df['Status'].unique()
+        )
+    with col3:
+        min_gmv = st.number_input("Минимальный GMV:", min_value=0.0, value=0.0)
+
+    # Применить фильтры
+    filtered_recs = recommendations_df[
+        (recommendations_df['Recommended_Action'].isin(action_filter)) &
+        (recommendations_df['Status'].isin(status_filter)) &
+        (recommendations_df['Current_GMV'] >= min_gmv)
+    ]
+
+    st.dataframe(
+        filtered_recs.style.background_gradient(subset=['Expected_Reward'], cmap='RdYlGn'),
+        use_container_width=True
+    )
+
+    # Сохранить рекомендации
+    st.session_state.recommendations = filtered_recs
+
+    # Кнопка экспорта
+    csv = filtered_recs.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Скачать рекомендации (CSV)",
+        data=csv,
+        file_name=f"sku_recommendations_{selected_store}.csv",
+        mime="text/csv"
+    )
+
+    # Dashboard
+    st.subheader("📊 Dashboard")
+    dashboard_fig = visualizer.create_dashboard(
+        initial_metrics=final_summary['initial_metrics'],
+        final_metrics=final_summary['final_metrics'],
+        action_breakdown=action_breakdown,
+        learning_curve_data=tracker.get_learning_curve(),
+        sku_df=st.session_state.sku_with_features
+    )
+    st.plotly_chart(dashboard_fig, use_container_width=True)
+
+
+# ============= FOOTER =============
+st.markdown("---")
+st.markdown("""
+<div style='text-align: center; color: #888;'>
+    <p>SKU Optimization System v1.0.0 | Powered by Reinforcement Learning (DQN)</p>
+    <p>⚠️ Рекомендации требуют валидации через A/B тестирование перед применением в production</p>
+</div>
+""", unsafe_allow_html=True)
